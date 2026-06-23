@@ -2,7 +2,7 @@ import hashlib
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from .models import Candidate, JobPosting, RecruiterPin
+from .models import Candidate, JobPosting, RecruiterPin, CandidateJobLink
 
 
 # -----------------------------
@@ -90,6 +90,14 @@ async def delete_job(db: AsyncSession, job_id: int) -> bool:
     job = result.scalars().first()
     if not job:
         return False
+
+    # Clean up any links pointing at this job so they don't become orphans.
+    links_result = await db.execute(
+        select(CandidateJobLink).where(CandidateJobLink.job_posting_id == job_id)
+    )
+    for link in links_result.scalars().all():
+        await db.delete(link)
+
     await db.delete(job)
     await db.commit()
     return True
@@ -102,15 +110,15 @@ async def get_jobs_with_counts(db: AsyncSession):
     output = []
 
     for job in jobs:
-        cand_result = await db.execute(
-            select(Candidate).where(Candidate.job_posting_id == job.id)
+        links_result = await db.execute(
+            select(CandidateJobLink).where(CandidateJobLink.job_posting_id == job.id)
         )
-        candidates = cand_result.scalars().all()
+        links = links_result.scalars().all()
 
-        submitted   = len(candidates)
-        shortlisted = sum(1 for c in candidates if c.status in ("KIV", "APPROVED"))
-        offered     = sum(1 for c in candidates if c.status in ("OFFERED", "HIRED"))
-        hired       = sum(1 for c in candidates if c.status == "HIRED")
+        submitted   = len(links)
+        shortlisted = sum(1 for l in links if l.status in ("KIV", "APPROVED"))
+        offered     = sum(1 for l in links if l.status in ("OFFERED", "HIRED"))
+        hired       = sum(1 for l in links if l.status == "HIRED")
         remaining   = max((job.openings or 0) - hired, 0)
 
         output.append({
@@ -136,10 +144,42 @@ async def get_jobs_with_counts(db: AsyncSession):
 
 
 async def get_job_candidates(db: AsyncSession, job_id: int):
+    """
+    Returns (Candidate, CandidateJobLink) pairs for everyone linked to this
+    job. A candidate appears once per link — if somehow linked twice to the
+    same job (shouldn't happen via the API) they'd show twice; callers
+    should treat link.id as the unique row identity, not candidate.id.
+    """
     result = await db.execute(
-        select(Candidate).where(Candidate.job_posting_id == job_id)
+        select(Candidate, CandidateJobLink)
+        .join(CandidateJobLink, CandidateJobLink.candidate_id == Candidate.id)
+        .where(CandidateJobLink.job_posting_id == job_id)
     )
-    return result.scalars().all()
+    return result.all()
+
+
+async def get_or_create_link(db: AsyncSession, candidate_id: int, job_id: int):
+    """
+    Links a candidate to a job if not already linked. If a link already
+    exists between this exact candidate and this exact job, returns it
+    unchanged (prevents duplicate rows from a second upload of the same
+    resume against the same job).
+    """
+    existing = await db.execute(
+        select(CandidateJobLink).where(
+            CandidateJobLink.candidate_id == candidate_id,
+            CandidateJobLink.job_posting_id == job_id,
+        )
+    )
+    link = existing.scalars().first()
+    if link:
+        return link, False
+
+    link = CandidateJobLink(candidate_id=candidate_id, job_posting_id=job_id)
+    db.add(link)
+    await db.commit()
+    await db.refresh(link)
+    return link, True
 
 
 async def check_and_mark_filled(db: AsyncSession, job_id: int):
@@ -148,10 +188,13 @@ async def check_and_mark_filled(db: AsyncSession, job_id: int):
     if not job:
         return
 
-    cand_result = await db.execute(
-        select(Candidate).where(Candidate.job_posting_id == job_id, Candidate.status == "HIRED")
+    links_result = await db.execute(
+        select(CandidateJobLink).where(
+            CandidateJobLink.job_posting_id == job_id,
+            CandidateJobLink.status == "HIRED",
+        )
     )
-    hired_count = len(cand_result.scalars().all())
+    hired_count = len(links_result.scalars().all())
 
     if hired_count >= (job.openings or 0) and job.status != "FILLED":
         job.status = "FILLED"
@@ -160,28 +203,28 @@ async def check_and_mark_filled(db: AsyncSession, job_id: int):
 
 
 # -----------------------------
-# DECISIONS (operates on shared candidates table)
+# DECISIONS (operate on a candidate_job_links row, not the candidate directly)
 # -----------------------------
 
-async def update_decision(db: AsyncSession, candidate_id, decision: str, reason: str = None, recruiter: str = None):
-    result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
-    candidate = result.scalars().first()
+async def update_link_decision(db: AsyncSession, link_id: int, decision: str, reason: str = None, recruiter: str = None):
+    result = await db.execute(select(CandidateJobLink).where(CandidateJobLink.id == link_id))
+    link = result.scalars().first()
 
-    if not candidate:
+    if not link:
         return None
 
-    candidate.status = decision
+    link.status = decision
 
     if decision == "ABSCONDED" and reason:
-        candidate.abscond_date = reason
+        link.abscond_date = reason
     elif decision == "REJECTED" and reason:
-        candidate.reject_reason = reason
+        link.reject_reason = reason
     elif decision == "HIRED":
         if recruiter:
-            candidate.recuiter_name = recruiter
-        candidate.hired_date = datetime.utcnow()
+            link.recruiter_name = recruiter
+        link.hired_date = datetime.utcnow()
 
     await db.commit()
-    await db.refresh(candidate)
+    await db.refresh(link)
 
-    return candidate
+    return link
