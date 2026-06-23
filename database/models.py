@@ -5,7 +5,7 @@ from .connection import Base
 # NOTE: This mirrors the EXISTING candidates table exactly (same DB, same
 # table name). SQLAlchemy's create_all() will see this table already
 # exists and will NOT touch it or its existing data — it only creates
-# tables that don't exist yet (job_postings, recruiter_pins below).
+# tables that don't exist yet (job_postings, recruiter_pins, candidate_job_links).
 
 class Candidate(Base):
     __tablename__ = "candidates"
@@ -25,6 +25,11 @@ class Candidate(Base):
     recuiter_name  = Column(String,   nullable=True)
     hired_date     = Column(DateTime, nullable=True)
     role_applied   = Column(String,   nullable=True)
+    # LEGACY — kept for backward compatibility with old data and the main
+    # ATS backend, which still writes/reads this column directly. The job
+    # board backend no longer reads or writes job_posting_id itself; a
+    # candidate's relationship(s) to jobs now live in candidate_job_links,
+    # which supports linking one candidate to MULTIPLE job postings.
     job_posting_id = Column(Integer,  ForeignKey("job_postings.id"), nullable=True)
 
 
@@ -42,6 +47,28 @@ class JobPosting(Base):
     date_filled     = Column(DateTime, nullable=True)
     remark          = Column(Text, nullable=True)
     status          = Column(String, default="OPEN")
+    created_at      = Column(DateTime, default=datetime.utcnow)
+
+
+class CandidateJobLink(Base):
+    """
+    Join table enabling one candidate to be linked to MULTIPLE job postings.
+    Status (KIV/REJECTED/OFFERED/HIRED/etc.) lives HERE, per job — not on
+    the candidate — because the same person can be at different stages on
+    different postings (e.g. rejected for Job A, hired for Job B).
+    """
+    __tablename__ = "candidate_job_links"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    candidate_id    = Column(Integer, ForeignKey("candidates.id"), nullable=False, index=True)
+    job_posting_id  = Column(Integer, ForeignKey("job_postings.id"), nullable=False, index=True)
+
+    status          = Column(String, default="PENDING")
+    reject_reason   = Column(String, nullable=True)
+    recruiter_name  = Column(String, nullable=True)
+    hired_date      = Column(DateTime, nullable=True)
+    abscond_date    = Column(String,   nullable=True)
+
     created_at      = Column(DateTime, default=datetime.utcnow)
 
 
