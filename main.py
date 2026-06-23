@@ -57,7 +57,9 @@ app.add_middleware(
 VALID_DECISIONS = {"APPROVED", "REJECTED", "KIV", "OFFERED", "HIRED", "RESIGNED", "ABSCONDED"}
 VALID_REJECT_REASONS = {"INCOMPLETE", "LOW_SKILL", "INSTRUCTIONS", "LEVEL_MISMATCH", "CULTURE", "VETTING"}
 
-
+class AuthVerify(BaseModel):
+    password: str
+    
 class JobPayload(BaseModel):
     client: str
     position_title: str
@@ -91,6 +93,20 @@ class RecruiterPinVerify(BaseModel):
 @app.get("/health")
 def health_check():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+@app.post("/auth/verify")
+async def verify_app_password(payload: AuthVerify, db: AsyncSession = Depends(get_db)):
+    """Checks a password against the same app_password used by the main ATS.
+    Used only to gate the job board frontend's login screen — read-only,
+    no side effects."""
+    result = await db.execute(select(Settings).where(Settings.id == 1))
+    settings = result.scalars().first()
+    correct_password = settings.app_password if settings else "admin123"
+
+    if payload.password != correct_password:
+        raise HTTPException(status_code=401, detail="Incorrect password")
+
+    return {"status": "ok"}
 
 
 # -------------------------
