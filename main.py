@@ -7,10 +7,10 @@ import httpx
 import sqlalchemy as sa
 
 from database.connection import get_db, engine, Base
-from database.models import Candidate, JobPosting, RecruiterPin, Settings
+from database.models import Candidate, JobPosting, RecruiterPin, Settings, CandidateJobLink
 from database.crud import (
     create_job, update_job, delete_job, get_jobs_with_counts,
-    get_job_candidates, check_and_mark_filled, update_decision,
+    get_job_candidates, get_or_create_link, check_and_mark_filled, update_link_decision,
     set_recruiter_pin, has_recruiter_pin, verify_recruiter_pin,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,7 +27,7 @@ app = FastAPI(title="OSADI Job Board")
 @app.on_event("startup")
 async def startup():
     async with engine.begin() as conn:
-        # Creates job_postings + recruiter_pins only.
+        # Creates job_postings + recruiter_pins + candidate_job_links only.
         # candidates + settings already exist and are left untouched.
         await conn.run_sync(Base.metadata.create_all)
 
@@ -57,9 +57,7 @@ app.add_middleware(
 VALID_DECISIONS = {"APPROVED", "REJECTED", "KIV", "OFFERED", "HIRED", "RESIGNED", "ABSCONDED"}
 VALID_REJECT_REASONS = {"INCOMPLETE", "LOW_SKILL", "INSTRUCTIONS", "LEVEL_MISMATCH", "CULTURE", "VETTING"}
 
-class AuthVerify(BaseModel):
-    password: str
-    
+
 class JobPayload(BaseModel):
     client: str
     position_title: str
@@ -72,7 +70,9 @@ class JobPayload(BaseModel):
 
 
 class DecisionPayload(BaseModel):
-    candidate_id: str
+    # link_id identifies WHICH job-relationship this decision applies to —
+    # required now that a candidate can be linked to multiple jobs at once.
+    link_id: int
     decision: str
     reason: str | None = None
     recruiter: str | None = None
@@ -90,9 +90,14 @@ class RecruiterPinVerify(BaseModel):
     pin: str
 
 
+class AuthVerify(BaseModel):
+    password: str
+
+
 @app.get("/health")
 def health_check():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
 
 @app.post("/auth/verify")
 async def verify_app_password(payload: AuthVerify, db: AsyncSession = Depends(get_db)):
@@ -142,17 +147,19 @@ async def remove_job_posting(job_id: int, db: AsyncSession = Depends(get_db)):
 
 @app.get("/jobs/{job_id}/candidates")
 async def candidates_for_job(job_id: int, db: AsyncSession = Depends(get_db)):
-    candidates = await get_job_candidates(db, job_id)
+    pairs = await get_job_candidates(db, job_id)
     return [
         {
+            "link_id": link.id,
             "id": c.id, "name": c.name, "email": c.email, "phone": c.phone,
-            "location": c.location, "score": c.score, "status": c.status,
+            "location": c.location, "score": c.score,
+            "status": link.status,
             "resume_text": c.resume_text, "resume_url": c.resume_url,
-            "reject_reason": c.reject_reason, "recruiter_name": c.recuiter_name,
-            "created_at": c.created_at.isoformat() if c.created_at else None,
-            "hired_date": c.hired_date.isoformat() if c.hired_date else None,
+            "reject_reason": link.reject_reason, "recruiter_name": link.recruiter_name,
+            "created_at": link.created_at.isoformat() if link.created_at else None,
+            "hired_date": link.hired_date.isoformat() if link.hired_date else None,
         }
-        for c in candidates
+        for c, link in pairs
     ]
 
 
@@ -164,8 +171,10 @@ async def analyze_for_job(
 ):
     """
     Forwards the resume to the EXISTING ATS backend for OCR + AI parsing
-    (no duplicate logic here), then links the resulting candidate record
-    to this job posting in the shared database.
+    (no duplicate logic here). If the candidate is brand new, links them
+    to this job. If the ATS reports they already exist (uploaded before,
+    possibly for a different job), links the EXISTING candidate record to
+    THIS job too — one candidate can be linked to multiple job postings.
     """
     job_result = await db.execute(select(JobPosting).where(JobPosting.id == job_id))
     job = job_result.scalars().first()
@@ -186,10 +195,27 @@ async def analyze_for_job(
         raise HTTPException(status_code=502, detail=f"Resume analysis service error: {e}")
 
     if result.get("duplicate"):
+        existing_id = result.get("existing_candidate_id")
+        if not existing_id:
+            # ATS flagged a duplicate but didn't tell us which candidate —
+            # nothing we can safely link, so just report it as before.
+            return {
+                "duplicate": True,
+                "linked": False,
+                "message": result.get("message"),
+                "existing_candidate_id": None,
+                "analysis": result.get("analysis"),
+            }
+
+        link, created = await get_or_create_link(db, existing_id, job_id)
+
         return {
             "duplicate": True,
+            "linked": True,
+            "already_linked_to_this_job": not created,
             "message": result.get("message"),
-            "existing_candidate_id": result.get("existing_candidate_id"),
+            "existing_candidate_id": existing_id,
+            "link_id": link.id,
             "analysis": result.get("analysis"),
         }
 
@@ -197,16 +223,28 @@ async def analyze_for_job(
 
     cand_result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
     candidate = cand_result.scalars().first()
+    link_id = None
     if candidate:
-        candidate.job_posting_id = job_id
+        # Keep legacy column populated for any old code path that still
+        # reads it directly, but the real relationship lives in the link table.
         candidate.role_applied = job.position_title
         await db.commit()
+        link, _ = await get_or_create_link(db, candidate_id, job_id)
+        link_id = link.id
 
-    return {"duplicate": False, "candidate_id": candidate_id, "analysis": result.get("analysis")}
+    return {
+        "duplicate": False,
+        "linked": True,
+        "candidate_id": candidate_id,
+        "link_id": link_id,
+        "analysis": result.get("analysis"),
+    }
 
 
 # -------------------------
 # Decisions (KIV / Reject / Hire) — PIN-protected for HIRED
+# Operates on a specific candidate-job LINK, since the same candidate can
+# have a different status on different job postings.
 # -------------------------
 
 @app.post("/decision")
@@ -237,12 +275,12 @@ async def set_decision(payload: DecisionPayload, db: AsyncSession = Depends(get_
         if not valid:
             raise HTTPException(status_code=401, detail="Incorrect PIN. This hire was not credited.")
 
-    updated = await update_decision(db, payload.candidate_id, decision, payload.reason, payload.recruiter)
-    if not updated:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    updated_link = await update_link_decision(db, payload.link_id, decision, payload.reason, payload.recruiter)
+    if not updated_link:
+        raise HTTPException(status_code=404, detail="Candidate-job link not found")
 
-    if decision == "HIRED" and getattr(updated, "job_posting_id", None):
-        await check_and_mark_filled(db, updated.job_posting_id)
+    if decision == "HIRED":
+        await check_and_mark_filled(db, updated_link.job_posting_id)
 
     return {"status": "ok"}
 
