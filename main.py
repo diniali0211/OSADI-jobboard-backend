@@ -9,7 +9,7 @@ import sqlalchemy as sa
 from database.connection import get_db, engine, Base
 from database.models import Candidate, JobPosting, RecruiterPin, Settings, CandidateJobLink
 from database.crud import (
-    create_job, update_job, delete_job, get_jobs_with_counts,
+    create_job, update_job, delete_job, get_jobs_with_counts, get_job_owner,
     get_job_candidates, get_or_create_link, check_and_mark_filled, update_link_decision,
     set_recruiter_pin, has_recruiter_pin, verify_recruiter_pin,
 )
@@ -39,6 +39,7 @@ async def startup():
             "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS job_posting_id INTEGER",
             "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS role_applied VARCHAR",
             "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS hired_date TIMESTAMP",
+            "ALTER TABLE job_postings ADD COLUMN IF NOT EXISTS created_by_recruiter VARCHAR",
         ]
         for stmt in migrations:
             try:
@@ -63,10 +64,17 @@ class JobPayload(BaseModel):
     position_title: str
     employment_type: str
     location: str | None = None
-    recruiter: str | None = None
+    recruiter: str  # required — every job posting must have a known creator
     openings: int = 1
     remark: str | None = None
     status: str | None = None
+
+
+class JobAuthPayload(BaseModel):
+    # Sent alongside edit/delete requests to verify the requester is the
+    # SAME recruiter who created this job posting.
+    recruiter: str
+    pin: str
 
 
 class DecisionPayload(BaseModel):
@@ -120,6 +128,14 @@ async def verify_app_password(payload: AuthVerify, db: AsyncSession = Depends(ge
 
 @app.post("/jobs")
 async def create_job_posting(payload: JobPayload, db: AsyncSession = Depends(get_db)):
+    pin_exists = await has_recruiter_pin(db, payload.recruiter)
+    if not pin_exists:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{payload.recruiter}' needs to set up a PIN before creating a job posting. "
+                   f"Ask an admin to set one up under Recruiter PINs."
+        )
+
     job = await create_job(db, payload.dict())
     return {"status": "ok", "job_id": job.id}
 
@@ -129,8 +145,33 @@ async def list_jobs(db: AsyncSession = Depends(get_db)):
     return await get_jobs_with_counts(db)
 
 
+class JobEditPayload(JobPayload):
+    pin: str  # the creator's PIN, required to prove they're the owner
+
+
 @app.put("/jobs/{job_id}")
-async def edit_job_posting(job_id: int, payload: JobPayload, db: AsyncSession = Depends(get_db)):
+async def edit_job_posting(job_id: int, payload: JobEditPayload, db: AsyncSession = Depends(get_db)):
+    job_exists, owner = await get_job_owner(db, job_id)
+    if not job_exists:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if owner is None:
+        raise HTTPException(
+            status_code=403,
+            detail="This posting predates recruiter ownership tracking and can't be edited. "
+                   "Delete it and recreate it under your name instead."
+        )
+
+    if owner != payload.recruiter:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Only {owner} can edit this posting."
+        )
+
+    valid = await verify_recruiter_pin(db, payload.recruiter, payload.pin)
+    if not valid:
+        raise HTTPException(status_code=401, detail="Incorrect PIN.")
+
     job = await update_job(db, job_id, payload.dict())
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -138,11 +179,33 @@ async def edit_job_posting(job_id: int, payload: JobPayload, db: AsyncSession = 
 
 
 @app.delete("/jobs/{job_id}")
-async def remove_job_posting(job_id: int, db: AsyncSession = Depends(get_db)):
+async def remove_job_posting(job_id: int, payload: JobAuthPayload, db: AsyncSession = Depends(get_db)):
+    job_exists, owner = await get_job_owner(db, job_id)
+    if not job_exists:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if owner is None:
+        raise HTTPException(
+            status_code=403,
+            detail="This posting predates recruiter ownership tracking and can't be deleted through this flow. "
+                   "Contact an admin if it needs to be removed."
+        )
+
+    if owner != payload.recruiter:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Only {owner} can delete this posting."
+        )
+
+    valid = await verify_recruiter_pin(db, payload.recruiter, payload.pin)
+    if not valid:
+        raise HTTPException(status_code=401, detail="Incorrect PIN.")
+
     success = await delete_job(db, job_id)
     if not success:
         raise HTTPException(status_code=404, detail="Job not found")
     return {"status": "ok"}
+
 
 @app.get("/candidates/{candidate_id}/resume-url")
 async def resume_url_proxy(candidate_id: int):
@@ -164,7 +227,8 @@ async def resume_url_proxy(candidate_id: int):
         raise HTTPException(status_code=502, detail=f"Main ATS error: {e}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Couldn't reach the main ATS: {e}")
-        
+
+
 @app.get("/jobs/{job_id}/candidates")
 async def candidates_for_job(job_id: int, db: AsyncSession = Depends(get_db)):
     pairs = await get_job_candidates(db, job_id)
@@ -217,8 +281,6 @@ async def analyze_for_job(
     if result.get("duplicate"):
         existing_id = result.get("existing_candidate_id")
         if not existing_id:
-            # ATS flagged a duplicate but didn't tell us which candidate —
-            # nothing we can safely link, so just report it as before.
             return {
                 "duplicate": True,
                 "linked": False,
@@ -245,8 +307,6 @@ async def analyze_for_job(
     candidate = cand_result.scalars().first()
     link_id = None
     if candidate:
-        # Keep legacy column populated for any old code path that still
-        # reads it directly, but the real relationship lives in the link table.
         candidate.role_applied = job.position_title
         await db.commit()
         link, _ = await get_or_create_link(db, candidate_id, job_id)
