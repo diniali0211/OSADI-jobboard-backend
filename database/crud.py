@@ -62,11 +62,23 @@ async def create_job(db: AsyncSession, data: dict):
         recruiter       = data.get("recruiter"),
         openings        = data.get("openings", 1),
         remark          = data.get("remark"),
+        created_by_recruiter = data.get("recruiter"),
     )
     db.add(job)
     await db.commit()
     await db.refresh(job)
     return job
+
+
+async def get_job_owner(db: AsyncSession, job_id: int):
+    """Returns (job_exists, created_by_recruiter). created_by_recruiter is
+    None both when the job doesn't exist AND when it predates the
+    ownership feature — callers must check job_exists to tell those apart."""
+    result = await db.execute(select(JobPosting).where(JobPosting.id == job_id))
+    job = result.scalars().first()
+    if not job:
+        return False, None
+    return True, job.created_by_recruiter
 
 
 async def update_job(db: AsyncSession, job_id: int, data: dict):
@@ -138,6 +150,7 @@ async def get_jobs_with_counts(db: AsyncSession):
             "offered":         offered,
             "hired":           hired,
             "remaining":       remaining,
+            "created_by_recruiter": job.created_by_recruiter,
         })
 
     return output
