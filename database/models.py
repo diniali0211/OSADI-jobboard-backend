@@ -36,18 +36,22 @@ class Candidate(Base):
 class JobPosting(Base):
     __tablename__ = "job_postings"
 
-    id              = Column(Integer, primary_key=True, index=True)
-    client          = Column(String)
-    position_title  = Column(String)
-    employment_type = Column(String)
-    location        = Column(String, nullable=True)
-    recruiter       = Column(String, nullable=True)
-    openings        = Column(Integer, default=1)
-    date_open       = Column(DateTime, default=datetime.utcnow)
-    date_filled     = Column(DateTime, nullable=True)
-    remark          = Column(Text, nullable=True)
-    status          = Column(String, default="OPEN")
-    created_at      = Column(DateTime, default=datetime.utcnow)
+    id                  = Column(Integer, primary_key=True, index=True)
+    client              = Column(String)
+    position_title      = Column(String)
+    employment_type     = Column(String)
+    location            = Column(String, nullable=True)
+    recruiter           = Column(String, nullable=True)
+    openings            = Column(Integer, default=1)
+    date_open           = Column(DateTime, default=datetime.utcnow)
+    date_filled         = Column(DateTime, nullable=True)
+    remark              = Column(Text, nullable=True)
+    status              = Column(String, default="OPEN")
+    created_at          = Column(DateTime, default=datetime.utcnow)
+    # Who created this posting — only this recruiter (verified via PIN) may
+    # edit or delete it. Nullable so existing rows created before this
+    # feature don't break; those rows simply have no enforced owner yet.
+    created_by_recruiter = Column(String, nullable=True)
 
 
 class CandidateJobLink(Base):
