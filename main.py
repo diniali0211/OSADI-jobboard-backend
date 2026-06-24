@@ -144,7 +144,27 @@ async def remove_job_posting(job_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Job not found")
     return {"status": "ok"}
 
-
+@app.get("/candidates/{candidate_id}/resume-url")
+async def resume_url_proxy(candidate_id: int):
+    """
+    The stored resume_url on a candidate is just an internal storage key
+    (e.g. 'resume/abc123_file.pdf'), not a usable link. The main ATS holds
+    the actual cloud storage logic and knows how to turn that key into a
+    real, openable URL — so we ask it rather than duplicating that logic
+    or guessing at a URL shape here.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(f"{ATS_BASE_URL}/resume-url/{candidate_id}")
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Resume not found")
+        raise HTTPException(status_code=502, detail=f"Main ATS error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Couldn't reach the main ATS: {e}")
+        
 @app.get("/jobs/{job_id}/candidates")
 async def candidates_for_job(job_id: int, db: AsyncSession = Depends(get_db)):
     pairs = await get_job_candidates(db, job_id)
