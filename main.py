@@ -11,7 +11,7 @@ from database.models import Candidate, JobPosting, RecruiterPin, Settings, Candi
 from database.crud import (
     create_job, update_job, delete_job, get_jobs_with_counts, get_job_owner, get_link_job_owner,
     get_job_candidates, get_or_create_link, check_and_mark_filled, update_link_decision,
-    set_recruiter_pin, has_recruiter_pin, verify_recruiter_pin,
+    set_recruiter_pin, has_recruiter_pin, verify_recruiter_pin, get_unassigned_applicants,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -102,6 +102,11 @@ class RecruiterPinVerify(BaseModel):
 
 class AuthVerify(BaseModel):
     password: str
+
+
+class MoveApplicantPayload(BaseModel):
+    # The recruiter moving this applicant — must own the target job.
+    recruiter: str
 
 
 @app.get("/health")
@@ -229,6 +234,154 @@ async def resume_url_proxy(candidate_id: int):
         raise HTTPException(status_code=502, detail=f"Main ATS error: {e}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Couldn't reach the main ATS: {e}")
+
+
+# -------------------------
+# Public Applicant Portal
+# A separate public site (not the recruiter job board) lets candidates
+# self-submit a resume + the role they're applying for. They land here as
+# UNASSIGNED — not yet linked to any job posting — until a recruiter moves
+# them into one of their own open jobs. Any recruiter may view and move
+# any applicant; ownership only applies once they're linked to a specific
+# job (the existing job-ownership rules then take over).
+# -------------------------
+
+@app.post("/applicants")
+async def submit_applicant(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    email: str = Form(...),
+    phone: str = Form(...),
+    role_applied: str = Form(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public endpoint — no auth, no recruiter identity. Forwards the resume
+    to the main ATS for the same OCR + AI parsing every other upload path
+    uses, then stores the candidate WITHOUT linking them to any job yet.
+    """
+    file_bytes = await file.read()
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{ATS_BASE_URL}/analyze",
+                files={"file": (file.filename, file_bytes, file.content_type)}
+            )
+        response.raise_for_status()
+        result = response.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Resume analysis service error: {e}")
+
+    if result.get("duplicate"):
+        existing_id_raw = result.get("existing_candidate_id")
+        existing_id = None
+        if existing_id_raw is not None:
+            try:
+                existing_id = int(existing_id_raw)
+            except (TypeError, ValueError):
+                existing_id = None
+
+        if existing_id is not None:
+            # Already in the system. Update their role_applied to reflect
+            # this latest application, but don't touch any job links —
+            # if they're already linked somewhere, that's left alone; if
+            # not, they simply stay (or become) an unassigned applicant.
+            cand_result = await db.execute(select(Candidate).where(Candidate.id == existing_id))
+            candidate = cand_result.scalars().first()
+            if candidate:
+                candidate.role_applied = role_applied
+                await db.commit()
+
+        return {
+            "duplicate": True,
+            "existing_candidate_id": existing_id,
+            "message": result.get("message"),
+        }
+
+    candidate_id_raw = result.get("candidate_id")
+    candidate_id = None
+    if candidate_id_raw is not None:
+        try:
+            candidate_id = int(candidate_id_raw)
+        except (TypeError, ValueError):
+            candidate_id = None
+
+    if candidate_id is not None:
+        cand_result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
+        candidate = cand_result.scalars().first()
+        if candidate:
+            # The portal collects name/email/phone/role directly — prefer
+            # these over whatever the resume parser guessed, since the
+            # candidate typed them in themselves just now.
+            candidate.name = name
+            candidate.email = email
+            candidate.phone = phone
+            candidate.role_applied = role_applied
+            await db.commit()
+
+    return {
+        "duplicate": False,
+        "candidate_id": candidate_id,
+        "analysis": result.get("analysis"),
+    }
+
+
+@app.get("/applicants")
+async def list_applicants(db: AsyncSession = Depends(get_db)):
+    """Recruiter-facing: everyone who applied via the public portal and
+    hasn't been moved into a job posting yet."""
+    applicants = await get_unassigned_applicants(db)
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "email": c.email,
+            "phone": c.phone,
+            "location": c.location,
+            "score": c.score,
+            "role_applied": c.role_applied,
+            "resume_text": c.resume_text,
+            "resume_url": c.resume_url,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+        }
+        for c in applicants
+    ]
+
+
+@app.post("/applicants/{candidate_id}/move-to-job/{job_id}")
+async def move_applicant_to_job(
+    candidate_id: int,
+    job_id: int,
+    payload: MoveApplicantPayload,
+    db: AsyncSession = Depends(get_db),
+):
+    """Links an unassigned applicant to a job posting. The recruiter must
+    own the TARGET job — same rule as uploading directly to it."""
+    job_result = await db.execute(select(JobPosting).where(JobPosting.id == job_id))
+    job = job_result.scalars().first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.created_by_recruiter is None:
+        raise HTTPException(
+            status_code=403,
+            detail="This posting predates recruiter ownership tracking, so applicants can't be moved into it."
+        )
+
+    if job.created_by_recruiter != payload.recruiter:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Only {job.created_by_recruiter} can move applicants into this posting."
+        )
+
+    cand_result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
+    candidate = cand_result.scalars().first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    link, created = await get_or_create_link(db, candidate_id, job_id)
+    return {"status": "ok", "link_id": link.id, "already_linked": not created}
 
 
 @app.get("/jobs/{job_id}/candidates")
