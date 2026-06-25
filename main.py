@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
@@ -9,7 +9,7 @@ import sqlalchemy as sa
 from database.connection import get_db, engine, Base
 from database.models import Candidate, JobPosting, RecruiterPin, Settings, CandidateJobLink
 from database.crud import (
-    create_job, update_job, delete_job, get_jobs_with_counts, get_job_owner,
+    create_job, update_job, delete_job, get_jobs_with_counts, get_job_owner, get_link_job_owner,
     get_job_candidates, get_or_create_link, check_and_mark_filled, update_link_decision,
     set_recruiter_pin, has_recruiter_pin, verify_recruiter_pin,
 )
@@ -83,8 +83,10 @@ class DecisionPayload(BaseModel):
     link_id: int
     decision: str
     reason: str | None = None
-    recruiter: str | None = None
-    pin: str | None = None
+    # Required for ALL decisions now (not just HIRED) — every action on a
+    # candidate-job link is restricted to that job's owner.
+    recruiter: str
+    pin: str | None = None  # only required when decision == HIRED
 
 
 class RecruiterPinSetup(BaseModel):
@@ -251,6 +253,7 @@ async def candidates_for_job(job_id: int, db: AsyncSession = Depends(get_db)):
 async def analyze_for_job(
     job_id: int,
     file: UploadFile = File(...),
+    recruiter: str = Form(...),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -259,11 +262,26 @@ async def analyze_for_job(
     to this job. If the ATS reports they already exist (uploaded before,
     possibly for a different job), links the EXISTING candidate record to
     THIS job too — one candidate can be linked to multiple job postings.
+
+    Only the job's owner may upload against it — non-owners are fully
+    view-only on someone else's posting.
     """
     job_result = await db.execute(select(JobPosting).where(JobPosting.id == job_id))
     job = job_result.scalars().first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.created_by_recruiter is None:
+        raise HTTPException(
+            status_code=403,
+            detail="This posting predates recruiter ownership tracking, so no one can upload to it through this flow."
+        )
+
+    if job.created_by_recruiter != recruiter:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Only {job.created_by_recruiter} can upload candidates to this posting."
+        )
 
     file_bytes = await file.read()
 
@@ -281,6 +299,8 @@ async def analyze_for_job(
     if result.get("duplicate"):
         existing_id = result.get("existing_candidate_id")
         if not existing_id:
+            # ATS flagged a duplicate but didn't tell us which candidate —
+            # nothing we can safely link, so just report it as before.
             return {
                 "duplicate": True,
                 "linked": False,
@@ -307,6 +327,8 @@ async def analyze_for_job(
     candidate = cand_result.scalars().first()
     link_id = None
     if candidate:
+        # Keep legacy column populated for any old code path that still
+        # reads it directly, but the real relationship lives in the link table.
         candidate.role_applied = job.position_title
         await db.commit()
         link, _ = await get_or_create_link(db, candidate_id, job_id)
@@ -338,9 +360,26 @@ async def set_decision(payload: DecisionPayload, db: AsyncSession = Depends(get_
         if not payload.reason or payload.reason not in VALID_REJECT_REASONS:
             raise HTTPException(status_code=400, detail="Valid reject reason required")
 
+    # Ownership check applies to EVERY decision (KIV, REJECTED, HIRED, etc.) —
+    # only the recruiter who created this job posting may act on candidates
+    # linked to it. Non-owners are fully view-only.
+    link_exists, _job_id, owner = await get_link_job_owner(db, payload.link_id)
+    if not link_exists:
+        raise HTTPException(status_code=404, detail="Candidate-job link not found")
+
+    if owner is None:
+        raise HTTPException(
+            status_code=403,
+            detail="This posting predates recruiter ownership tracking, so candidates on it can't be updated through this flow."
+        )
+
+    if owner != payload.recruiter:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Only {owner} can update candidates on this posting."
+        )
+
     if decision == "HIRED":
-        if not payload.recruiter:
-            raise HTTPException(status_code=400, detail="Recruiter name is required to mark as hired")
         if not payload.pin:
             raise HTTPException(status_code=400, detail="PIN is required to confirm this hire")
 
