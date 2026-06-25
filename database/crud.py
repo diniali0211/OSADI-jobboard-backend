@@ -72,13 +72,18 @@ async def create_job(db: AsyncSession, data: dict):
 
 async def get_unassigned_applicants(db: AsyncSession):
     """
-    Returns candidates who applied via the public portal but haven't been
-    linked to any job posting yet — i.e. they have zero rows in
-    candidate_job_links. This is the recruiter-facing "Applicants" pool.
+    Returns candidates who submitted through the NEW public job-board
+    portal specifically (applied_via_portal == True) and haven't been
+    linked to any job posting yet. Filtering on applied_via_portal — not
+    just "no job link" — keeps pre-existing ATS/legacy candidates who
+    simply never got linked from flooding this list.
     """
     linked_ids_subquery = select(CandidateJobLink.candidate_id).distinct()
     result = await db.execute(
-        select(Candidate).where(Candidate.id.not_in(linked_ids_subquery))
+        select(Candidate).where(
+            Candidate.applied_via_portal == True,  # noqa: E712
+            Candidate.id.not_in(linked_ids_subquery),
+        )
     )
     return result.scalars().all()
 
