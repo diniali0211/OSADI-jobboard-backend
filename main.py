@@ -40,6 +40,7 @@ async def startup():
             "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS role_applied VARCHAR",
             "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS hired_date TIMESTAMP",
             "ALTER TABLE job_postings ADD COLUMN IF NOT EXISTS created_by_recruiter VARCHAR",
+            "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS applied_via_portal BOOLEAN",
         ]
         for stmt in migrations:
             try:
@@ -287,10 +288,15 @@ async def submit_applicant(
             # this latest application, but don't touch any job links —
             # if they're already linked somewhere, that's left alone; if
             # not, they simply stay (or become) an unassigned applicant.
+            # Marking applied_via_portal=True here matters even for a
+            # pre-existing candidate: if Fatin originally came in through
+            # the main ATS directly and THEN applies via this new portal,
+            # she should now show up in the Applicants pool too.
             cand_result = await db.execute(select(Candidate).where(Candidate.id == existing_id))
             candidate = cand_result.scalars().first()
             if candidate:
                 candidate.role_applied = role_applied
+                candidate.applied_via_portal = True
                 await db.commit()
 
         return {
@@ -318,6 +324,7 @@ async def submit_applicant(
             candidate.email = email
             candidate.phone = phone
             candidate.role_applied = role_applied
+            candidate.applied_via_portal = True
             await db.commit()
 
     return {
