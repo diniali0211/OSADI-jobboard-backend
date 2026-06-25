@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Text, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, Text, DateTime, ForeignKey, Boolean
 from datetime import datetime
 from .connection import Base
 
@@ -25,6 +25,12 @@ class Candidate(Base):
     recuiter_name  = Column(String,   nullable=True)
     hired_date     = Column(DateTime, nullable=True)
     role_applied   = Column(String,   nullable=True)
+    # Set to True ONLY by the new public job-board portal's /applicants
+    # endpoint. Left NULL/unset for every other path (main ATS uploads,
+    # the OLD OSADI-apply portal, direct recruiter uploads) — this is how
+    # the Applicants page distinguishes genuine new-portal submissions
+    # from pre-existing candidates that simply happen to have no job link.
+    applied_via_portal = Column(Boolean, nullable=True, default=None)
     # LEGACY — kept for backward compatibility with old data and the main
     # ATS backend, which still writes/reads this column directly. The job
     # board backend no longer reads or writes job_posting_id itself; a
