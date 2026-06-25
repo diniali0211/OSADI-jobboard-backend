@@ -195,6 +195,13 @@ async def get_or_create_link(db: AsyncSession, candidate_id: int, job_id: int):
     unchanged (prevents duplicate rows from a second upload of the same
     resume against the same job).
     """
+    # Defense in depth: Postgres raises a hard error comparing a string
+    # against an Integer column (unlike SQLite, which coerces silently) —
+    # cast here too in case a caller forgets, since this function is the
+    # single choke point for every candidate-job link in the app.
+    candidate_id = int(candidate_id)
+    job_id = int(job_id)
+
     existing = await db.execute(
         select(CandidateJobLink).where(
             CandidateJobLink.candidate_id == candidate_id,
