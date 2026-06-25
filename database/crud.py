@@ -70,6 +70,23 @@ async def create_job(db: AsyncSession, data: dict):
     return job
 
 
+async def get_link_job_owner(db: AsyncSession, link_id: int):
+    """For a given candidate_job_link, returns (link_exists, job_posting_id,
+    created_by_recruiter) — used to verify the requester owns the JOB this
+    link belongs to before letting them KIV/reject/hire on it."""
+    result = await db.execute(select(CandidateJobLink).where(CandidateJobLink.id == link_id))
+    link = result.scalars().first()
+    if not link:
+        return False, None, None
+
+    job_result = await db.execute(select(JobPosting).where(JobPosting.id == link.job_posting_id))
+    job = job_result.scalars().first()
+    if not job:
+        return False, None, None
+
+    return True, job.id, job.created_by_recruiter
+
+
 async def get_job_owner(db: AsyncSession, job_id: int):
     """Returns (job_exists, created_by_recruiter). created_by_recruiter is
     None both when the job doesn't exist AND when it predates the
