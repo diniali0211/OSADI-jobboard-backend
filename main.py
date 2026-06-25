@@ -297,8 +297,8 @@ async def analyze_for_job(
         raise HTTPException(status_code=502, detail=f"Resume analysis service error: {e}")
 
     if result.get("duplicate"):
-        existing_id = result.get("existing_candidate_id")
-        if not existing_id:
+        existing_id_raw = result.get("existing_candidate_id")
+        if not existing_id_raw:
             # ATS flagged a duplicate but didn't tell us which candidate —
             # nothing we can safely link, so just report it as before.
             return {
@@ -308,6 +308,17 @@ async def analyze_for_job(
                 "existing_candidate_id": None,
                 "analysis": result.get("analysis"),
             }
+
+        # The main ATS's JSON response may serialize this as a string —
+        # Postgres (unlike SQLite) raises a hard error comparing a string
+        # against an Integer column, so cast explicitly before any query.
+        try:
+            existing_id = int(existing_id_raw)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Main ATS returned an unusable candidate id: {existing_id_raw!r}"
+            )
 
         link, created = await get_or_create_link(db, existing_id, job_id)
 
@@ -321,7 +332,16 @@ async def analyze_for_job(
             "analysis": result.get("analysis"),
         }
 
-    candidate_id = result.get("candidate_id")
+    candidate_id_raw = result.get("candidate_id")
+    candidate_id = None
+    if candidate_id_raw is not None:
+        try:
+            candidate_id = int(candidate_id_raw)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Main ATS returned an unusable candidate id: {candidate_id_raw!r}"
+            )
 
     cand_result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
     candidate = cand_result.scalars().first()
