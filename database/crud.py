@@ -70,6 +70,19 @@ async def create_job(db: AsyncSession, data: dict):
     return job
 
 
+async def get_unassigned_applicants(db: AsyncSession):
+    """
+    Returns candidates who applied via the public portal but haven't been
+    linked to any job posting yet — i.e. they have zero rows in
+    candidate_job_links. This is the recruiter-facing "Applicants" pool.
+    """
+    linked_ids_subquery = select(CandidateJobLink.candidate_id).distinct()
+    result = await db.execute(
+        select(Candidate).where(Candidate.id.not_in(linked_ids_subquery))
+    )
+    return result.scalars().all()
+
+
 async def get_link_job_owner(db: AsyncSession, link_id: int):
     """For a given candidate_job_link, returns (link_exists, job_posting_id,
     created_by_recruiter) — used to verify the requester owns the JOB this
